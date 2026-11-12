@@ -151,10 +151,15 @@ class Collector:
                     headers.get("message_id_hdr"),
                 )
                 for part, (rel_path, size_bytes) in zip(parts, published):
-                    db.insert_attachment(
+                    cur = db.insert_attachment(
                         db._conn, message_pk, part.part_number,
                         stored_filename(part), part.content_type,
                         size_bytes, rel_path,
+                    )
+                    # 每份 PDF 各建一项识别任务，与索引/进度同一事务提交：
+                    # 提交即存在任务，回滚则任务也不存在，不会漏建或重复建。
+                    db.insert_recognition_task(
+                        db._conn, cur, uidvalidity, uid, part.part_number
                     )
                 db.commit()
             except Exception:

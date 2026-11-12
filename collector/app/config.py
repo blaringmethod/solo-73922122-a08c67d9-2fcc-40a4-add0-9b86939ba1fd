@@ -17,6 +17,7 @@ class Settings:
 
     # ---- 业务限制 ----
     max_message_bytes: int  # 每封邮件上限，默认 8 MiB
+    recognition_lease_seconds: int  # 识别任务领取凭据有效期，默认 30 秒
 
     # ---- 本地存储 ----
     data_dir: str           # SQLite 与原件根目录
@@ -41,6 +42,7 @@ def load_settings() -> Settings:
         imap_mailbox=_env("IMAP_MAILBOX", "INBOX"),
         socket_timeout=int(_env("IMAP_SOCKET_TIMEOUT", "30")),
         max_message_bytes=int(_env("MAX_MESSAGE_BYTES", str(8 * 1024 * 1024))),
+        recognition_lease_seconds=int(_env("RECOGNITION_LEASE_SECONDS", "30")),
         data_dir=data_dir,
         db_path=os.path.join(data_dir, "collector.db"),
         blob_root=os.path.join(data_dir, "blobs"),

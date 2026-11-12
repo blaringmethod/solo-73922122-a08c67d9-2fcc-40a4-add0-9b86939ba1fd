@@ -48,11 +48,32 @@ services:
       IMAP_MAILBOX: "INBOX"
       IMAP_SOCKET_TIMEOUT: "30"
       MAX_MESSAGE_BYTES: "8388608"  # 8 MiB
+      RECOGNITION_LEASE_SECONDS: "30"  # 识别任务领取凭据有效期
       DATA_DIR: "/data"
     volumes:
       - collectordata:/data
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # 识别客户端演示容器：docker compose run --rm client
+  # 用纯标准库调用 /api/recognition/tasks/claim 与 /submit，演示双客户端争领、
+  # 到期重领与旧凭据迟到提交。
+  client:
+    build: ./collector
+    depends_on:
+      collector:
+        condition: service_healthy
+    volumes:
+      - ./tools:/tools:ro
+    working_dir: /tools
+    entrypoint: ["python", "/tools/clientdemo.py", "--base", "http://collector:8000"]
+    profiles: ["demo"]
+    restart: "no"
 
 volumes:
   maildata:

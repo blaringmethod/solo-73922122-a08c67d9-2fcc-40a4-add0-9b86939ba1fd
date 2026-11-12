@@ -1,9 +1,12 @@
-# 共享收票邮箱 PDF 采集服务
+# 共享收票邮箱 PDF 采集与识别任务服务
 
-从固定配置的共享收票邮箱（IMAP）归集发票 PDF 原件，供后续发票识别入仓。
+从固定配置的共享收票邮箱（IMAP）归集发票 PDF 原件，为**每份 PDF**建立持久识别任务，
+供财务数据工程师的识别客户端领取并回填发票号与金额（本服务不做 OCR）。
 技术栈：**FastAPI + SQLite + 本地文件存储**，并附带一个零第三方依赖的**本地 IMAP 演示服务**。
 
 ## 能力与约束对照
+
+### 采集
 
 | 需求 | 实现 |
 | --- | --- |
@@ -20,6 +23,23 @@
 | 重启续采不重复 | 已落库邮件（done/oversize/failed）按 (UIDVALIDITY, UID) 跳过；断流/落盘失败等未落库邮件才重采；正式路径由 UIDVALIDITY/UID/部分序号确定，重试幂等 |
 | 仅一个采集进程，并发不并行 | `fcntl` 排他文件锁（跨进程）+ 线程锁（同进程并发立即 409，不排队） |
 
+### 识别任务归集
+
+| 需求 | 实现 |
+| --- | --- |
+| 历史及新采集的每份 PDF 各建一项持久任务 | 新采集在邮件/附件同一事务内建任务；启动时 `NOT EXISTS + UNIQUE(attachment_id)` 幂等回填历史附件；无 PDF 邮件不建任务 |
+| 保留 UIDVALIDITY、UID、MIME 部分序号 | `recognition_tasks` 表冗余记录三者 + `attachment_id`；附件行提供原件地址 |
+| 客户端领取取原件地址与 30 秒有效凭据 | `POST /api/recognition/tasks/claim` 返回 `original_file_url`、`credential`、`lease_expires_at` |
+| 并发不能重复领取 | `BEGIN IMMEDIATE` + 条件 `UPDATE`，多进程/多线程实测同一任务只发放一次 |
+| 到期可重领 | 租约到期（`RECOGNITION_LEASE_SECONDS`，默认 30 秒）后同一任务重新可领，新凭据替换旧凭据 |
+| 未完成任务只接受当前未过期凭据 | 提交时校验凭据哈希且 `lease_expires_at > now`；旧凭据/过期凭据返回 409 |
+| 提交非空发票号 + 非负整数分金额，不实现 OCR | Pydantic 校验：发票号 `min_length=1` 且去空白后非空，金额 `int >= 0`（单位：分）；服务端只落库客户端结果 |
+| 结果与任务完成状态一起保存 | 首次完成用同一条 `UPDATE` 同时写 `status='completed'` 与结果 |
+| 已完成任务用原凭据重交同内容返回原结果 | 保留完成时凭据哈希；同内容返回 200 + 原结果（`replayed=true`），异内容 409 `content_conflict`；其它凭据 409 |
+| 按邮件查询全部完成才整体返回 | `GET /api/messages/{id}/recognition`：未齐只返回 `progress`（`results` 为空），全部完成返回结果 |
+| 重启保留任务、结果与原截止时间 | 任务、租约截止时间、结果全在 SQLite；启动只回填缺失任务、不重建/不重置 |
+| 保留原采集下载接口 | `/api/messages/attachments/{id}/download`、`/api/sources/{uv}/{uid}/download` 原样保留 |
+
 ## 目录结构
 
 ```
@@ -31,6 +51,7 @@
 │   └── app/
 │       ├── main.py             # API 入口（/docs）
 │       ├── collector.py        # 采集流水线与事务/故障边界
+│       ├── recognition.py      # 识别任务：领取 / 提交 / 按邮件汇总
 │       ├── imap_client.py      # 只读 IMAP（EXAMINE + UID + BODY.PEEK）
 │       ├── pdf_extract.py      # MIME 遍历、PDF 提取、部分序号
 │       ├── storage.py          # staging -> 原子发布 -> blobs
@@ -44,7 +65,9 @@
 │       ├── state.py            # 邮箱状态（删信/重建/断流开关）
 │       ├── seed.py             # 5 封演示邮件播种
 │       └── control.py          # 邮箱控制 CLI
-└── tools/demo.sh               # 端到端演示脚本
+└── tools/
+    ├── demo.sh                 # 采集端到端演示脚本
+    └── clientdemo.py           # 识别客户端演示：争领 / 到期重领 / 迟到提交
 ```
 
 ## 快速开始
@@ -52,21 +75,23 @@
 ```bash
 docker compose up -d --build
 # 浏览器打开
-#   http://localhost:8000/docs      采集/进度/下载 Swagger 文档
+#   http://localhost:8000/docs      采集/识别任务/下载 Swagger 文档
 #   IMAP 演示端口 127.0.0.1:1430
 ```
 
 启动后 `imap-seed` 一次性任务会写入 5 封演示邮件：
 
-| UID | 内容 | 预期 |
+| 顺序 | 内容 | 预期 |
 | --- | --- | --- |
-| 1 | 单个 PDF | done，1 附件 |
-| 2 | 两个**同名** PDF + 一个 txt | done，2 附件，序号 1.2 / 1.3 |
-| 3 | 多附件大邮件（约 6.7 MiB） | 断流演示目标 |
-| 4 | 约 8.3 MiB 超限邮件 | oversize，不拉正文 |
-| 5 | 无附件纯文本 | done，0 附件 |
+| 1 | 单个 PDF | done，1 附件，1 识别任务 |
+| 2 | 两个**同名** PDF + 一个 txt | done，2 附件，序号 1.2 / 1.3，2 识别任务 |
+| 3 | 多附件大邮件（约 6.7 MiB） | 断流演示目标，2 识别任务 |
+| 4 | 约 8.3 MiB 超限邮件 | oversize，不拉正文，0 识别任务 |
+| 5 | 无附件纯文本 | done，0 附件，0 识别任务 |
 
 ## API 入口（详见 /docs）
+
+### 采集与来源
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -79,6 +104,30 @@ docker compose up -d --build
 | GET  | `/api/sources/{uidvalidity}/{uid}` | **按来源（UIDVALIDITY+UID）** 定位 |
 | GET  | `/api/messages/attachments/{id}/download` | 下载单个 PDF 原件 |
 | GET  | `/api/sources/{uidvalidity}/{uid}/download` | 按来源 ZIP 打包下载该封全部 PDF |
+
+### 识别任务归集
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/recognition/tasks/claim` | 领取一项待识别 PDF；无任务返回 `204`。响应含 `original_file_url`、`credential`（30 秒有效，仅出现一次）、`lease_expires_at` |
+| POST | `/api/recognition/tasks/{task_id}/submit` | 提交 `credential` + 非空 `invoice_number` + 非负整数 `amount_cents`（分） |
+| GET  | `/api/recognition/tasks` | 任务列表，可按 `status`/`uidvalidity`/`uid` 过滤 |
+| GET  | `/api/recognition/tasks/{task_id}` | 单任务状态与结果 |
+| GET  | `/api/recognition/stats` | 全部任务完成进度（total/completed/pending/leased） |
+| GET  | `/api/messages/{id}/recognition` | **按邮件**查询：全部 PDF 完成才返回整体结果，未齐只返回进度 |
+| GET  | `/api/sources/{uidvalidity}/{uid}/recognition` | 按来源查询识别结果（语义同上） |
+
+提交结果语义：
+
+| 场景 | HTTP | 说明 |
+| --- | --- | --- |
+| 未完成任务 + 当前未过期凭据 | 200 | 结果与 `completed` 状态同一 UPDATE 保存 |
+| 已完成任务 + 原凭据 + 同内容 | 200 | `replayed=true`，返回原结果 |
+| 已完成任务 + 原凭据 + 异内容 | 409 `content_conflict` | 拒绝，并附原结果 |
+| 已完成任务 + 非原凭据 | 409 `credential_not_original` | 拒绝 |
+| 未完成任务 + 旧凭据（已重领） | 409 `credential_stale` | 只接受当前凭据 |
+| 未完成任务 + 凭据已过期 | 409 `credential_expired` | 需重新领取 |
+| 空/纯空白发票号、负数或非整数金额 | 422 | 请求体校验失败 |
 
 ## 演示三个关键场景
 
@@ -113,11 +162,43 @@ curl http://localhost:8000/api/progress   # 出现两个 UIDVALIDITY 代际，�
 
 一键全流程演示：`bash tools/demo.sh`。
 
+## 演示识别任务归集（双客户端争领、到期重领、旧凭据迟到提交）
+
+```bash
+docker compose up -d --build
+curl -X POST http://localhost:8000/api/collect          # 采集并建任务（UID1/2/3 共 5 份 PDF）
+curl -X POST http://localhost:8000/api/recognition/stats
+
+# 一键演示（默认等待 30 秒租约到期；可用 --lease-wait 2 加速）
+docker compose run --rm client
+# 或本地：
+python3 tools/clientdemo.py --base http://localhost:8000 --lease-wait 30
+```
+
+`tools/clientdemo.py` 会依次演示：
+
+1. 两个客户端**并发领取**：拿到不同的 `task_id`（无任务时返回 204）；
+2. 客户端 A 不提交，等待 30 秒凭据过期；
+3. 客户端 B **重新领取**同一任务（新凭据即刻替换旧凭据），并通过 `original_file_url` 下载原件；
+4. 客户端 A 用**旧凭据迟到提交** → `409 credential_stale`；
+5. 客户端 B 用新凭据提交成功 → 200；再用原凭据**重交同内容** → 200 `replayed=true`；
+   重交异内容 → `409 content_conflict`。
+
+按邮件查看整体识别结果（UID2 有两个 PDF，两份都提交后才返回结果）：
+
+```bash
+curl http://localhost:8000/api/sources/<UIDVALIDITY>/2/recognition   # 未齐：state=pending，results=[]
+# 全部提交后：state=completed，results 含每份 PDF 的发票号与金额
+```
+
+重启保留演示：`docker compose restart collector` 后任务、结果、凭据原截止时间不变
+（凭据已过期则重领；已完成任务用原凭据仍可重交取回原结果）。
+
 ## 存储布局
 
 ```
 /data
-├── collect.db                     # SQLite（WAL）
+├── collect.db                     # SQLite（WAL）：邮件/附件索引 + recognition_tasks
 ├── collect.lock                   # 单采集进程排他锁
 ├── staging/tmp-<uuid>/            # 半封临时区，成功或失败后即清空
 └── blobs/
@@ -127,6 +208,16 @@ curl http://localhost:8000/api/progress   # 出现两个 UIDVALIDITY 代际，�
             └── 1.3__invoice.pdf
 ```
 
+识别任务表 `recognition_tasks` 关键字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `attachment_id` | 唯一引用附件；`UNIQUE` 保证每份 PDF 只有一项任务 |
+| `uidvalidity` / `uid` / `part_number` | 来源三元组，领取时随任务返回 |
+| `status` | `pending` / `completed` |
+| `lease_token_hash` / `lease_expires_at` | 当前凭据哈希与截止时间；持久化，重启不重置 |
+| `invoice_number` / `amount_cents` / `completed_at` | 识别结果，与 `status='completed'` 同一 UPDATE 写入 |
+
 ## 本地开发（无 Docker）
 
 ```bash
@@ -134,6 +225,9 @@ curl http://localhost:8000/api/progress   # 出现两个 UIDVALIDITY 代际，�
 pip install -r collector/requirements.txt
 DATA_DIR=./_data IMAP_HOST=127.0.0.1 IMAP_PORT=1430 \
   uvicorn app.main:app --reload --app-dir collector
+
+# 识别客户端演示（纯标准库，无需额外依赖）
+python3 tools/clientdemo.py --base http://localhost:8000 --lease-wait 30
 
 # IMAP 演示服务（纯标准库）
 PYTHONPATH=imap_server MAIL_DATA_DIR=./_mail IMAP_BIND_PORT=1430 \

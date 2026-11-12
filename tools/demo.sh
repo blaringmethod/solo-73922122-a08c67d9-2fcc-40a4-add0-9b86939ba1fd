@@ -70,4 +70,9 @@ curl -sS -o /tmp/source-bundle.zip -w "来源 ZIP 下载 HTTP: %{http_code}, 字
   "$BASE/api/sources/$NEW_UV/2/download"
 python3 -c 'import zipfile; print("ZIP 内容:", zipfile.ZipFile("/tmp/source-bundle.zip").namelist())'
 
+line "9. 识别任务：双客户端争领、到期重领、旧凭据迟到提交"
+api "/api/recognition/stats"
+# 演示容器内跑完整流程（等待 31 秒让 30 秒凭据过期）
+docker compose run --rm -T client --lease-wait 31
+
 line "完成。浏览器打开 $BASE/docs 可在线试用全部 API"
